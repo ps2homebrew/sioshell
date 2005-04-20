@@ -134,14 +134,14 @@ D_OP(BEQL)	{
     if ((!RS) && (!RT)) {
 	Name(BL);     OfS16();
     } else if (!RT) {
-	Name(BEZL);   GPR(RT); Sep(); OfS16();
+	Name(BEQZL);  GPR(RS); Sep(); OfS16();
     } else {
 	Name(BEQL);   GPR(RT); Sep(); GPR(RS); Sep(); OfS16();
     }
 }
 D_OP(BNEL)	{
     if (!RT) {
-	Name(BNZL);   GPR(RT); Sep(); OfS16();
+	Name(BNZL);   GPR(RS); Sep(); OfS16();
     } else {
 	Name(BNEL);   GPR(RT); Sep(); GPR(RS); Sep(); OfS16();
     }
