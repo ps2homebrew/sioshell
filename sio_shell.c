@@ -2267,7 +2267,7 @@ void sio_shell_level1()
 					 if(bp >= 0)
 					 {
 						 clear_swbp(bp);
-						 disasm((u32 *) _level1SavedRegs.EPC, 1);
+						 disasm_verbose(g_currSavedRegs, (u32 *) g_currSavedRegs->EPC);
 					 }
 					 else
 					 {
@@ -2364,7 +2364,7 @@ void sio_shell_level2()
 		}
 		printf("\n");
 		SetBPC(bpc & bpcmask);
-		disasm((u32 *) _level2SavedRegs.ErrorPC, 1);
+		disasm_verbose(g_currSavedRegs, (u32 *) g_currSavedRegs->ErrorPC);
 
 		sio_getc();
 		shell();

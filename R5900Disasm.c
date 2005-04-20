@@ -878,3 +878,8 @@ void disasm(const u32 *addr, int num)
 		addr += 1;
 	}
 }
+
+void disasm_verbose(const struct ee_regs* regs, const u32* addr)
+{
+    disasmR5900(*addr, (u32) addr);
+}
