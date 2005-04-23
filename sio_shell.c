@@ -1853,7 +1853,7 @@ static void step_generic(int skip)
 													 rs = (opcode >> 21) & 0x1f;
 													 targetpc = regs->r[rs].r32[0];
 													 branch = 1;
-													 cond = 1;
+													 cond = 0;
 												 }
 												 break;
 							 };
@@ -2015,6 +2015,7 @@ void siosh_init(void)
 	install_level1_handler();
 	init_swbps();
 	find_sioprintf();
+	_syscallTable->print = (void *) g_sio_printf;
 
 	g_cli_pos = 0;
 	g_cli_size = 0;

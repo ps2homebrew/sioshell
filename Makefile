@@ -6,7 +6,7 @@ EE_LIBS = libsiosh.a -ldebug
 all: $(EE_OUTPUT)
 
 $(EE_OUTPUT) : $(EE_BIN)
-		ps2-packer -s stub/n2e-kmode-0088-stub $(EE_BIN) $(EE_OUTPUT)
+		ps2-packer -s stub/n2e-kmode-1d00-stub $(EE_BIN) $(EE_OUTPUT)
 		rm -f $(EE_BIN)
 
 $(EE_BIN) : main.o $(EE_LIB)
