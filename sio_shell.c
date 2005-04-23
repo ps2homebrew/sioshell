@@ -1775,6 +1775,9 @@ static void step_generic(int skip)
 	int link   = 0;
 	struct ee_regs *regs;
 
+	/* Disable the hw breakpoints first */
+	InitBPC();
+
 	if(g_currLevel == 1)
 	{
 		epc = _level1SavedRegs.EPC;
@@ -1836,7 +1839,7 @@ static void step_generic(int skip)
 							 u32 ofs;
 							 
 							 ofs = opcode & 0x3ffffff;
-							 targetpc = (ofs * 2) | (targetpc & 0xf0000000);
+							 targetpc = (ofs << 2) | (targetpc & 0xf0000000);
 							 branch = 1;
 							 cond = 0;
 						 }
