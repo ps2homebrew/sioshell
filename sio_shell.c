@@ -831,9 +831,9 @@ static u32 get_bpi_opts(const char *str_opts)
 
 	if((str_opts) && (str_opts[0] != 0))
 	{
+		opts = 0;
 		while(*str_opts)
 		{
-			opts = 0;
 			switch(upcase(*str_opts))
 			{
 				case 'U' : opts |= BPC_IUE;
@@ -896,9 +896,9 @@ static u32 get_bpd_opts(const char *str_opts)
 
 	if((str_opts) && (str_opts[0] != 0))
 	{
+		opts = 0;
 		while(*str_opts)
 		{
-			opts = 0;
 			switch(upcase(*str_opts))
 			{
 				case 'R' : opts |= BPC_DRE;
@@ -919,7 +919,6 @@ static u32 get_bpd_opts(const char *str_opts)
 			};
 			str_opts++;
 		}
-
 		if((opts & (BPC_DRE | BPC_DWE)) == 0)
 		{
 			printf("Could not determine read/write. Setting default\n");
@@ -1255,14 +1254,6 @@ static int exec_build_args(void)
 		g_elf_args[arg_pos++] = 0;
 
 		arg = strtok(NULL, " \t");
-	}
-
-	if(arg_count > 0)
-	{
-		for(i = 0; i < arg_count; i++)
-		{
-			printf("%d %s\n", i, g_elf_args_ptr[i]);
-		}
 	}
 
 	return arg_count;
