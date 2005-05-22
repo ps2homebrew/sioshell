@@ -1,7 +1,7 @@
 EE_BIN = siosh_dont_run_this.elf
 EE_LIB = libsiosh.a
 EE_OUTPUT=siosh.elf
-EE_OBJS = exceptions.o sio_shell.o R5900Disasm.o
+EE_OBJS = exceptions.o sio_shell.o R5900Disasm.o ymodem.o iopmon.o
 EE_LIBS = libsiosh.a -ldebug
 all: $(EE_OUTPUT)
 

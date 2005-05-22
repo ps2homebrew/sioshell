@@ -267,8 +267,8 @@ D_OP(JALR)	{
 }
 D_OP(MOVZ)	{ Name(MOVZ);   GPR(RD); Sep(); GPR(RS); Sep(); GPR(RT); IsZero(SA); }
 D_OP(MOVN)	{ Name(MOVN);   GPR(RD); Sep(); GPR(RS); Sep(); GPR(RT); IsZero(SA); }
-D_OP(SYSCALL)	{ Name(SYSCALL); printf("%d\n", (opcode >> 6) & 0xFFFFF); } // **TODO**
-D_OP(BREAK)	{ Name(BREAK);  printf("%d\n", (opcode >> 6) & 0xFFFFF); } // **TODO**
+D_OP(SYSCALL)	{ Name(SYSCALL); printf("%d", (opcode >> 6) & 0xFFFFF); } // **TODO**
+D_OP(BREAK)	{ Name(BREAK);  printf("%d", (opcode >> 6) & 0xFFFFF); } // **TODO**
 // hole at 001110
 D_OP(SYNC)	{
     if (SA & 0x10) {

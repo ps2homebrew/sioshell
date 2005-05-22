@@ -170,8 +170,12 @@ extern printf_type g_sio_printf;
 #define printf g_sio_printf
 
 extern struct syscall_table *_syscallTable;
+extern struct syscall_table *_syscallTableOld;
 
 /* Flush instruction and data caches */
 void flush_cache(void);
+
+/* Restart the level1 syscall handler */
+void restartSyscallException(void);
 
 #endif

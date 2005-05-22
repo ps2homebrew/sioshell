@@ -11,6 +11,8 @@
 #include <sio_shell.h>
 #include <hwbp.h>
 #include "R5900Disasm.h"
+#include "ymodem.h"
+#include "iopmon.h"
 
 ////////////////////////////////////////////////////////////////////////////////
 // Function Prototypes
@@ -28,6 +30,7 @@ static int pd_cmd(void);
 static int dr_cmd(void);
 static int er_cmd(void);
 static int exec_cmd(void);
+static int start_cmd(void);
 static int dis_cmd(void);
 static int bpi_cmd(void);
 static int bpv_cmd(void);
@@ -45,6 +48,13 @@ static int skip_cmd(void);
 static int dt_cmd(void);
 static int ch_cmd(void);
 static int ih_cmd(void);
+static int recv_cmd(void);
+static int send_cmd(void);
+static int ct_cmd(void);
+static int sp_cmd(void);
+static int hs_cmd(void);
+static int us_cmd(void);
+static int baud_cmd(void);
 
 ////////////////////////////////////////////////////////////////////////////////
 // Global Variables
@@ -78,10 +88,15 @@ extern struct ee_regs _level2SavedRegs;
 /* Saved registers from level1 handler */
 extern struct ee_regs _level1SavedRegs;
 /* Pointer to the syscall table */
-//u32* _syscallTable;
 struct syscall_table* _syscallTable;
+/* Pointer to the stored syscall table (for hooking) */
+struct syscall_table* _syscallTableOld;
 /* Current exception level */
 int	 g_currLevel;
+/* Pointer to the kernel thread setup routine */
+int (*g_thread_setup)(char *, u32, u32, u32);
+/* Break on syscall */
+int  g_breakOnSyscall;
 
 ////////////////////////////////////////////////////////////////////////////////
 // Utility Functions
@@ -142,6 +157,18 @@ static int is_hex(char ch)
 		return 1;
 
 	if((ch >= 'A') && (ch <= 'F'))
+		return 1;
+
+	return 0;
+}
+
+static int is_alnum(char ch)
+{
+	ch = upcase(ch);
+	if((ch >= '0') && (ch <= '9'))
+		return 1;
+
+	if((ch >= 'A') && (ch <= 'Z'))
 		return 1;
 
 	return 0;
@@ -218,6 +245,20 @@ static u32 hextoi(const char *hex)
 	return (u32) hextoi_generic(hex, 8);
 }
 
+static u32 dectoi(const char *dec)
+{
+	u32 i = 0;
+
+	while((*dec) && (*dec >= '0') && (*dec <= '9'))
+	{
+		i *= 10;
+		i += *dec - '0';
+		dec++;
+	}
+
+	return i;
+}
+
 /* List of EE register names */
 static const unsigned char regName[32][5] =
 {
@@ -252,44 +293,6 @@ static u32 *find_reg32(const char *reg)
 	}
 
 	return NULL;
-}
-
-// Return 1 if decode was successful
-static int decode_memaddr(const char *straddr, u32 *memaddr)
-{
-	int ret = 0;
-	// This is a register
-	if(straddr[0] == '$')
-	{
-		const u32 *reg_data;
-		
-		reg_data = find_reg32(&straddr[1]);
-		if(reg_data)
-		{
-			*memaddr = reg_data[0];
-			ret = 1;
-		}
-		else
-		{
-			printf("Could not find register %s\n", straddr);
-			ret = 0;
-		}
-	}
-	else
-	{
-		if(is_hex(straddr[0]))
-		{
-			*memaddr = hextoi(straddr);
-			ret = 1;
-		}
-		else
-		{
-			printf("Could not decode address %s\n", straddr);
-			ret = 0;
-		}
-	}
-
-	return ret;
 }
 
 #define MEM_ATTRIB_READ	 (1 << 0)
@@ -346,6 +349,194 @@ static s32 validate_memaddr(u32 addr, u32 attrib)
 	return size_left;
 }
 
+// Return 1 if decode was successful
+// Takes forms either $reg or addr or $reg+ofs/$ref-ofs with optional @'s for dereferencing
+static int decode_memaddr(const char *straddr, u32 *memaddr)
+{
+	int ret = 0;
+	int deref = 0;
+	int i = 0;
+	u32 addr = 0;
+
+	/* We are dereferencing */
+	while(*straddr == '@')
+	{
+		/* Incremement the deref count */
+		deref++;
+		straddr++;
+	}
+
+	// This is a register
+	if(straddr[0] == '$')
+	{
+		const u32 *reg_data;
+		char reg_name[8];
+		int reg_pos;
+		int ofs;
+		int sign;
+		
+		straddr++;
+		reg_pos = 0;
+		while((is_alnum(*straddr)) && (reg_pos < 7))
+		{
+			reg_name[reg_pos++] = *straddr++;
+		}
+		reg_name[reg_pos] = 0;
+
+		reg_data = find_reg32(reg_name);
+		if(reg_data)
+		{
+			addr = reg_data[0];
+
+			/* Let's get an offset if it exists */
+			do
+			{
+				if(*straddr == '+')
+				{
+					sign = 1;
+					straddr++;
+				}
+				else if(*straddr == '-')
+				{
+					sign = -1;
+					straddr++;
+				}
+				else
+				{
+					break;
+				}
+
+				if(is_hex(*straddr))
+				{
+					ofs = hextoi(straddr);
+					addr += sign * ofs;
+				}
+			}
+			while(0);
+
+			ret = 1;
+		}
+		else
+		{
+			printf("Could not find register %s\n", straddr);
+			ret = 0;
+		}
+	}
+	else
+	{
+		if(is_hex(straddr[0]))
+		{
+			addr = hextoi(straddr);
+			ret = 1;
+		}
+		else
+		{
+			printf("Could not decode address %s\n", straddr);
+			ret = 0;
+		}
+	}
+
+	/* Only deref if it was valid */
+	i = 0;
+	while((i < deref) && (ret))
+	{
+		addr = addr & ~3;
+		if(validate_memaddr(addr, MEM_ATTRIB_READ | MEM_ATTRIB_WORD))
+		{
+			addr = _lw(addr);
+		}
+		else
+		{
+			printf("Invalid de-reference at depth %d (%08x)\n", i, addr);
+			ret = 0;
+		}
+		i++;
+	}
+
+	if(ret)
+	{
+		*memaddr = addr;
+	}
+
+
+	return ret;
+}
+
+#if 0
+// Return 1 if decode was successful
+// Takes forms either $reg or addr or $reg[ofs] with optional @'s for dereferencing
+static int decode_memaddr(const char *straddr, u32 *memaddr)
+{
+	int ret = 0;
+	int deref = 0;
+	int i = 0;
+	u32 addr = 0;
+
+	/* We are dereferencing */
+	while(*straddr == '@')
+	{
+		/* Incremement the deref count */
+		deref++;
+		straddr++;
+	}
+
+	// This is a register
+	if(straddr[0] == '$')
+	{
+		const u32 *reg_data;
+		
+		reg_data = find_reg32(&straddr[1]);
+		if(reg_data)
+		{
+			addr = reg_data[0];
+			ret = 1;
+		}
+		else
+		{
+			printf("Could not find register %s\n", straddr);
+			ret = 0;
+		}
+	}
+	else
+	{
+		if(is_hex(straddr[0]))
+		{
+			addr = hextoi(straddr);
+			ret = 1;
+		}
+		else
+		{
+			printf("Could not decode address %s\n", straddr);
+			ret = 0;
+		}
+	}
+
+	/* Only deref if it was valid */
+	i = 0;
+	while((i < deref) && (ret))
+	{
+		addr = addr & ~3;
+		if(validate_memaddr(addr, MEM_ATTRIB_READ | MEM_ATTRIB_WORD))
+		{
+			addr = _lw(addr);
+		}
+		else
+		{
+			printf("Invalid de-reference at depth %d (%08x)\n", i, addr);
+			ret = 0;
+		}
+		i++;
+	}
+
+	if(ret)
+	{
+		*memaddr = addr;
+	}
+
+
+	return ret;
+}
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////
 // Debugging functions
@@ -478,7 +669,7 @@ static void install_debug_handler(void)
    flush_cache();
 }
 
-/* Install a Level 1 BREAK handler */
+/* Install a Level 1 BREAK and Syscall handler */
 static void install_level1_handler(void)
 {
 	_syscallTable->SetVCommonHandler(9, level1ExceptionHandler);
@@ -514,10 +705,11 @@ struct sh_command commands[] = {
 	{ "poked", "pd", pd_cmd, "Poke in doubles", "poked pokeaddr value [value2 ...]" },
 	{ "fill",  "fi" , fill_cmd, "Fill memory up with a single byte value", "fill memaddr size val"},
 	{ "copy",  "cp" , copy_cmd, "Copy memory from one place to another", "copy srcaddr destaddr size"},
-	{ "find",  "fd" , find_cmd, "Find an ASCII or hex string in memory", "find startaddr endaddr \"ASCII\"/Hex Values [mask M1...]" },
+	{ "find",  "fd" , find_cmd, "Find an ASCII or hex string in memory", "find startaddr size \"ASCII\"/Hex Values [mask M1...]" },
 	{ "dumpreg", "dr", dr_cmd, "Dump EE regs", "dumpreg" },
 	{ "editreg", "er", er_cmd, "Edit an EE reg (32bit only)", "editreg $reg value" },
-	{ "exec", NULL, exec_cmd, "Exec a program", "exec elfname" },
+	{ "exec", NULL, exec_cmd, "Exec a program (LoadExecPS2)", "exec elfname [arg1 arg2 ...]" },
+	{ "start", NULL, start_cmd, "Start an already loaded program (ExecPS2)", "start addr [arg1 arg2 ...]" }, 
 	{ "disasm", "dis", dis_cmd, "Disassemble instructions", "disasm disaddr [count]" },
 	{ "bpinst", "bpi", bpi_cmd, "Set the hardware instruction bp", "bpinst address mask [uskx]" },
 	{ "bpdata", "bpd", bpd_cmd, "Set the hardware data bp", "bpdata address mask [rwuskx]" },
@@ -530,6 +722,13 @@ struct sh_command commands[] = {
 	{ "step", "s", step_cmd, "Step to the next instruction", "step" },
 	{ "skip", "k", skip_cmd, "Step the next command, skipping sub routine jump", "skip" },
 	{ "dumpt", "dt", dt_cmd, "Dump the current thread list", "dumpt" },
+	{ "recv", NULL, recv_cmd, "Receive a data block using ymodem", "recv startaddr [maxsize]" },
+	{ "send", NULL, send_cmd, "Send a data block using ymodem", "send startaddr size filename" },
+	{ "createt", "ct", ct_cmd, "Create a new thread on the EE", "createt startaddr stackaddr priority" },
+	{ "sprint", "sp", sp_cmd, "Write out a print handler to EE memeory", "sprint startaddr" },
+	{ "hooksys", "hs", hs_cmd, "Hook the syscall handler and optionally break", "hooksys [break]" },
+	{ "unhksys", "us", us_cmd, "Unhook the syscall handler", "unhksys" },
+	{ "baud", NULL, baud_cmd, "Set the SIO baud rate", "baud (9600|19200|38400|57600|115200)" },
 	{ "clihist", "ch", ch_cmd, "Displays the CLI history", "clihist" },
 	{ "insthdl", "ih", ih_cmd, "Install EE exception handlers for common errors", "insthld" },
 	{ "help", "?", help_cmd, "Help (Obviously)", "help [command]" },
@@ -679,8 +878,6 @@ static int md_cmd(void)
 	mem_addr = strtok(NULL, " ");
 	if((mem_addr != NULL) && (decode_memaddr(mem_addr, &addr)))
 	{
-		//addr = hextoi(mem_addr); 
-
 		size_left = validate_memaddr(addr, MEM_ATTRIB_READ | MEM_ATTRIB_BYTE);
 
 		if(size_left > 0)
@@ -1238,7 +1435,6 @@ static int exec_build_args(void)
 	char *arg;
 	int arg_pos;
 	int arg_count;
-	int i;
 
 	arg_pos = 0;
 	arg_count = 0;
@@ -1263,17 +1459,12 @@ static int exec_build_args(void)
 int exec_cmd(void)
 {
 	char *elf_name;
-	int (*_thread_setup)(char *, u32, u32, u32);
-	u32 inst;
+	//u32 inst;
 	u32 exec_addr;
 	int ret;
 	ee_thread_t thread;
 	int arg_count;
 
-	/* Load the address of the kernel thread setup routine */
-	inst = _lw(0x800010b0);
-	_thread_setup = (void *) (0x80000000 | ((inst & 0x3FFFFFF) << 2));
-	
 	elf_name = strtok(NULL, " \t");
 	if(elf_name != NULL)
 	{
@@ -1297,7 +1488,7 @@ int exec_cmd(void)
 		{
 			exec_addr = 0x100000;
 			/* Create a thread for our boot stub, use ROMVER cause we can :) */
-			_thread_setup("ROMVER", 0x100000, 32 * 1024 * 1024 - 0x10000, 0);
+			g_thread_setup("ROMVER", 0x100000, 32 * 1024 * 1024 - 0x10000, 0);
 		}
 		else /* Already a thread (user app) running */
 		{
@@ -1320,7 +1511,7 @@ int exec_cmd(void)
 		{
 			_sw(0x20050000 | arg_count, exec_addr + 8);
 			_sw(0x3c060000 | (((u32) g_elf_args_ptr) >> 16), exec_addr + 12);
-			_sw(0x34860000 | (((u32) g_elf_args_ptr) & 0xFFFF), exec_addr + 16);
+			_sw(0x34c60000 | (((u32) g_elf_args_ptr) & 0xFFFF), exec_addr + 16);
 		}
 		else
 		{
@@ -1362,18 +1553,133 @@ int exec_cmd(void)
 	return CMD_OK;
 }
 
+static int start_cmd(void)
+{
+	char *mem_addr;
+	u32 exec_addr;
+	int ret;
+	ee_thread_t thread;
+	int arg_count;
+
+	mem_addr = strtok(NULL, " \t");
+	if(mem_addr)
+	{
+		u32 addr;
+
+		addr = hextoi(mem_addr);
+		if(validate_memaddr(addr, MEM_ATTRIB_EXEC) == 0)
+		{
+			printf("Invalid execute address\n");
+			return CMD_ERROR;
+		}
+
+		arg_count = exec_build_args();
+
+		printf("Executing from %08x\n", addr);
+
+		/* Get current thread */
+		ret = _syscallTable->ReferThreadStatus(0, &thread);
+		/* If it is EENULL then create a new thread at 0x100000 */
+		if(thread.func < (void *) 0x90000)
+		{
+			exec_addr = 0xfff00;
+			/* Create a thread for our boot stub, use ROMVER cause we can :) */
+			g_thread_setup("ROMVER", exec_addr, 32 * 1024 * 1024 - 0x10000, 0);
+		}
+		else /* Already a thread (user app) running */
+		{
+			if(g_currLevel == 1)
+			{
+				exec_addr = g_currSavedRegs->EPC;
+			}
+			else
+			{
+				exec_addr = g_currSavedRegs->ErrorPC;
+			}
+		}
+
+		/* Write in our code stub */
+		/* Set a0 to be the start address */
+		_sw(0x3c040000 | (addr >> 16), exec_addr);
+		_sw(0x34840000 | (addr & 0xFFFF), exec_addr + 4);
+
+		if(arg_count > 0)
+		{
+			/* Set gp to 0 */
+			_sw(0x3c050000, exec_addr + 8);
+			/* Set arg count in a2 */
+			_sw(0x20060000 | arg_count, exec_addr + 12);
+			/* Set arg pointer in a3 */	
+			_sw(0x3c070000 | (((u32) g_elf_args_ptr) >> 16), exec_addr + 16);
+			_sw(0x34e70000 | (((u32) g_elf_args_ptr) & 0xFFFF), exec_addr + 20);
+		}
+		else
+		{
+			_sw(0x3c050000, exec_addr + 8);
+			_sw(0x3c060000, exec_addr + 12);
+			_sw(0x3c070000, exec_addr + 16);
+			_sw(0x00000000, exec_addr + 20);
+		}
+
+		_sw(0x24030007, exec_addr + 24);
+		_sw(0x0000000c, exec_addr + 28);
+		_sw(0x03e00008, exec_addr + 32);
+		_sw(0x00000000, exec_addr + 36);
+
+		/* Set return PC to the start of our stub */
+		if(g_currLevel == 1)
+		{
+			if(g_currSavedRegs->EPC != exec_addr)
+			{
+				g_currSavedRegs->EPC = exec_addr;
+			}
+		}
+		else
+		{
+			if(g_currSavedRegs->ErrorPC != exec_addr)
+			{
+				g_currSavedRegs->ErrorPC = exec_addr;
+			}
+		}
+		
+		flush_cache();
+
+		return CMD_EXITSHELL;
+	}
+	else
+	{
+		return CMD_ERROR;
+	}
+
+	return CMD_OK;
+
+}
+
 /* Disassemble command */
 static int dis_cmd(void)
 {
 	char *addr;
 	char *count;
 	u32 disaddr;
-	u32 discount = 1;
+	/* Kinda useless otherwise */
+	u32 discount = 8;
 
 	addr = strtok(NULL, " \t");
 	count = strtok(NULL, "  \t");
 
-	if((addr != NULL) && (decode_memaddr(addr, &disaddr)))
+	if(addr == NULL)
+	{
+		if(g_currLevel == 1)
+		{
+			addr = "$epc";
+		}
+		else
+		{
+			addr = "$errorpc";
+		}
+	}
+
+	if(decode_memaddr(addr, &disaddr))
 	{
 		int bytes_left;
 
@@ -1384,7 +1690,7 @@ static int dis_cmd(void)
 			discount = hextoi(count);
 		}
 
-		bytes_left = validate_memaddr(disaddr, MEM_ATTRIB_EXEC | MEM_ATTRIB_READ | MEM_ATTRIB_WORD);
+		bytes_left = validate_memaddr(disaddr, MEM_ATTRIB_READ | MEM_ATTRIB_WORD);
 		if(bytes_left > 4)
 		{
 			discount = discount > (bytes_left / 4) ? bytes_left / 4 : discount;
@@ -1713,6 +2019,10 @@ static int fill_cmd(void)
 			printf("Invalid memory address %08x\n", addr);
 		}
 	}
+	else
+	{
+		ret = CMD_ERROR;
+	}
 
 	return ret;
 }
@@ -1945,10 +2255,157 @@ static int dt_cmd(void)
 		ret = _syscallTable->ReferThreadStatus(i, &thread);
 		if(ret)
 		{
-			printf("Thread %d func %08x stack %08x gp %08x status %08x\n", 
-					i, (u32) thread.func, (u32) thread.stack, (u32) thread.initial_priority, thread.status);
+			printf("Thread %d func %08x stack %08x gp %08x status %08x pri %d\n", 
+					i, (u32) thread.func, (u32) thread.stack, (u32) thread.initial_priority, 
+					thread.status, thread.current_priority);
 				
 		}
+	}
+
+	return CMD_OK;
+}
+
+static int ct_cmd(void)
+{
+	char *mem_addr;
+	char *mem_stack;
+	char *mem_priority;
+
+	mem_addr = strtok(NULL, " \t");
+	mem_stack = strtok(NULL, " \t");
+	mem_priority = strtok(NULL, " \t");
+	if((mem_addr) && (mem_stack) && (mem_priority))
+	{
+		u32 addr;
+		u32 stack;
+		u32 priority;
+
+		addr = hextoi(mem_addr) & ~3;
+		stack = (hextoi(mem_stack) & ~16) - 0x10000;
+		priority = hextoi(mem_priority) & 127;
+		if(validate_memaddr(addr, MEM_ATTRIB_EXEC) > 0)
+		{
+			if(validate_memaddr(stack, MEM_ATTRIB_READ | MEM_ATTRIB_WRITE) > 0x10000)
+			{
+				int thid;
+				ee_thread_t thread;
+
+				g_thread_setup("ROMVER", addr, stack, 0);
+				/* Let's try and find the thread we just created */
+				/* We assume there will only be one :P */
+				for(thid = 1; thid < 128; thid++)
+				{
+					_syscallTable->ReferThreadStatus(thid, &thread);
+					if(thread.func == (void*) addr)
+					{
+						break;
+					}
+				}
+
+				if(thid < 128)
+				{
+					_syscallTable->iChangeThreadPriority(thid, priority);
+				}
+				else
+				{
+					printf("Create thread failed\n");
+				}
+			}
+			else
+			{
+				printf("Invalid stack address %08x\n", stack);
+			}
+		}
+		else
+		{
+			printf("Invalid start address %08x\n", addr);
+		}
+	}
+	else
+	{
+		return CMD_ERROR;
+	}
+
+	return CMD_OK;
+}
+
+static int send_cmd(void)
+{
+	char *mem_addr;
+	char *mem_size;
+	char *mem_filename;
+
+	mem_addr = strtok(NULL, " \t");
+	mem_size = strtok(NULL, " \t");
+	mem_filename = strtok(NULL, " \t");
+
+	if((mem_addr) && (mem_size) && (mem_filename))
+	{
+		u32 addr;
+		u32 size;
+		u32 bytes_left;
+
+		addr = hextoi(mem_addr);
+		size = hextoi(mem_size);
+		bytes_left = validate_memaddr(addr, MEM_ATTRIB_READ | MEM_ATTRIB_BYTE);
+		if(bytes_left < size)
+		{
+			size = bytes_left;
+		}
+
+		printf("Sending %08x size %d\n", addr, size);
+		ymodem_send_data((u8 *)addr, size, mem_filename);
+	}
+	else
+	{
+		return CMD_ERROR;
+	}
+
+	return CMD_OK;
+}
+
+static int recv_cmd(void)
+{
+	char *mem_addr;
+	char *mem_size;
+
+	mem_addr = strtok(NULL, " \t");
+	mem_size = strtok(NULL, " \t");
+
+	if(mem_addr)
+	{
+		u32 addr;
+		int size;
+		int valid_size;
+
+		addr = hextoi(mem_addr);
+		valid_size = validate_memaddr(addr, MEM_ATTRIB_WRITE | MEM_ATTRIB_BYTE);
+
+		if(mem_size)
+		{
+			size = hextoi(mem_size);
+			/* Adjust to be at maximum the valid size */
+			size = size > valid_size ? valid_size : size;
+		}
+		else
+		{
+			size = valid_size;
+		}
+
+		if(size > 0)
+		{
+			printf("Receving data to address %08x, max size %d\n", addr, size);
+			ymodem_recv_data((u8*) addr, size);
+			flush_cache();
+		}
+		else
+		{
+			printf("Invalid memory region\n");
+		}
+	}
+	else
+	{
+		return CMD_ERROR;
 	}
 
 	return CMD_OK;
@@ -1989,6 +2446,98 @@ static int ih_cmd(void)
 	return CMD_OK;
 }
 
+static int sp_cmd(void)
+{
+	char *mem_addr;
+
+	mem_addr = strtok(NULL, " \t");
+	if(mem_addr)
+	{
+		u32 addr;
+
+		addr = hextoi(mem_addr) & ~3;
+		if(validate_memaddr(addr, MEM_ATTRIB_EXEC | MEM_ATTRIB_WRITE) >= 16)
+		{
+			_sw(0x24030075, addr);
+			_sw(0xc, addr+4);
+			_sw(0x3e00008, addr+8);
+			_sw(0, addr+12);
+		}
+	}
+	else
+	{
+		return CMD_ERROR;
+	}
+
+	return CMD_OK;
+}
+
+/* Hook system call command */
+static int hs_cmd(void)
+{
+	char *mem_break;
+
+	mem_break = strtok(NULL, " \t");
+	if((mem_break) && (strcasecmp(mem_break, "break") == 0))
+	{
+		printf("Hooking syscall with break\n");
+		g_breakOnSyscall = 1;
+	}
+	else
+	{
+		printf("Hooking syscall without break\n");
+		g_breakOnSyscall = 0;
+	}
+
+	_syscallTable->SetVCommonHandler(8, level1ExceptionHandler);
+
+	return CMD_OK;
+}
+
+/* Unhook system call handler */
+static int us_cmd(void)
+{
+	g_breakOnSyscall = 0;
+	_syscallTable->SetVCommonHandler(8, (void*) 0x80000280);
+	printf("Unhooked syscall\n");
+
+	return CMD_OK;
+}
+
+static int baud_cmd(void)
+{
+	char *mem_baud;
+
+	mem_baud = strtok(NULL, " \t");
+	if(mem_baud)
+	{
+		u32 baud;
+
+		baud = dectoi(mem_baud);
+		switch(baud)
+		{
+			case 9600:
+			case 19200:
+			case 38400:
+			case 57600:
+			case 115200: break;
+			default: printf("Invalid baud rate %d\n", baud);
+					 return CMD_ERROR;
+		};
+
+		printf("Setting baud rate %d\n", baud);
+		sio_init(baud, 0, 0, 0, 0);
+		/* Exit immediately */
+		return CMD_EXITSHELL;
+	}
+	else
+	{
+		return CMD_ERROR;
+	}
+
+	return CMD_OK;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Shell Main functions
 ////////////////////////////////////////////////////////////////////////////////
@@ -2000,22 +2549,31 @@ void siosh_init(void)
 {
     u32 *pAddr;
 	int i;
+	u32 inst;
+
+	sio_init(115200, 0, 0, 0, 0);
 
 	// Get the syscall table pointer
     pAddr = (u32 *) 0x800002f0;
     _syscallTable = (struct syscall_table *) ((pAddr[0] << 16) | (pAddr[2] & 0xFFFF));
+	_syscallTableOld = (struct syscall_table *) (0x80070000 - sizeof(struct syscall_table));
+
+	inst = _lw(0x800010b0);
+	g_thread_setup = (void *) (0x80000000 | ((inst & 0x3FFFFFF) << 2));
 
 	install_debug_handler();
 	install_level1_handler();
 	init_swbps();
 	find_sioprintf();
 	_syscallTable->print = (void *) g_sio_printf;
+	install_sifhook();
 
 	g_cli_pos = 0;
 	g_cli_size = 0;
 	g_lastcli_pos = 0;
 	g_currcli_pos = 0;
 	g_insert_mode = 0;
+	g_breakOnSyscall = 0;
 	memset(g_cli, 0, CLI_MAX);
 
 	for(i = 0; i < CLI_HISTSIZE; i++)
@@ -2172,7 +2730,7 @@ static void cli_handle_escape(void)
 
 
 				default: 
-							printf("2 Unknown character %d\n", ch);
+							printf("Unknown character %d\n", ch);
 						   break;
 			};
 		}
@@ -2200,6 +2758,18 @@ static void shell()
 		switch(ch)
 		{
 			case -1 : break; // No char
+					  /* ^D */
+			case 4  : printf("\nExiting Shell\n");
+					  exit_shell = 1;
+					  break;
+			case 0xB : /* ^K */
+					  printf("\n");
+					  exit_shell = skip_cmd();
+					  break;
+			case 0x13 : /* ^S */
+					  printf("\n");
+					  exit_shell = step_cmd();
+					  break;
 			case 8  : if(g_cli_pos > 0)
 					  {
 						  g_cli_pos--;
@@ -2243,6 +2813,47 @@ static void print_exception(void)
 	printf("Exception %s\n", codeTxt[cause]);
 }
 
+#define REG_A0 (g_currSavedRegs->r[4].r32[0])
+#define REG_A1 (g_currSavedRegs->r[5].r32[0])
+#define REG_A2 (g_currSavedRegs->r[6].r32[0])
+#define REG_A3 (g_currSavedRegs->r[7].r32[0])
+
+/* If break on syscall set and we hit a syscall we want then return */
+int handle_syscall(int syscall)
+{
+	int break_syscall = 1;
+	/* Only handle ones we are interested in */
+	switch(syscall)
+	{
+		case 4:		printf("Exit\n");
+					break_syscall = 0;
+					break;
+		case 6: 	printf("LoadExecPS2 elf %s, argcount %d, argp %08x\n", REG_A0, REG_A1, REG_A2);
+					break;
+		case 7:		printf("ExecPS2 entry %08x gp %08x argcount %d argp %08x\n", REG_A0, REG_A1, REG_A2, REG_A3);
+					break;
+		case 0xA :  printf("AddSbusIntcHandler cause %d, handler %08x\n", REG_A0, REG_A1);
+					break;
+		case 0xc :  printf("Interrupt2Iop cause %d\n", REG_A0);
+					break;
+		case 0x20 : {
+						ee_thread_t *thread;
+						thread = (ee_thread_t *) REG_A0;
+						printf("CreateThread func %08x, sp %08x, gp %08x, pri %d\n", 
+								thread->func, thread->stack, thread->gp_reg, thread->initial_priority);
+						break;
+					}
+		case 0x22 : {
+						printf("StartThread thid %d, args %08x\n", REG_A0, REG_A1);
+					}
+					break;
+		default:	break_syscall = 0;
+					break;
+	};
+
+	return break_syscall;
+}
+
 /* Main function in a level1 exception */
 void sio_shell_level1()
 {
@@ -2254,6 +2865,23 @@ void sio_shell_level1()
 
 	switch((_level1SavedRegs.Cause >> 2) & 0xf)
 	{
+		// Handle syscall
+		case 8 : {
+					 int ret;
+					 ret = handle_syscall(_level1SavedRegs.r[3].r32[0]);
+					 /* If we chose to break, then err break :P */
+					 if(ret && g_breakOnSyscall)
+					 {
+						 shell();
+					 }
+					clear_RX_FIFO();
+					/* Clear interrupt status regs */
+				    _sw(SIO_IER_ERDAI | SIO_IER_ELSI, SIO_ISR);
+				    ier = _lw(SIO_IER);
+				    _sw(SIO_IER_ERDAI | SIO_IER_ELSI | ier, SIO_IER);
+				    restartSyscallException();
+				 }
+				 break;
 		// At break if it one of ours reset the original instruction, flush and jump back
 		case 9 : {
 					 int bp;
@@ -2278,7 +2906,6 @@ void sio_shell_level1()
 
 	shell();
 	clear_RX_FIFO();
-
    /* Clear interrupt status regs */
    _sw(SIO_IER_ERDAI | SIO_IER_ELSI, SIO_ISR);
    ier = _lw(SIO_IER);

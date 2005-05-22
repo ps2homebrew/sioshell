@@ -19,13 +19,13 @@
 	.ent _start
 
 _start:
-	addiu  sp, sp, -16
+	addiu  sp, sp, -16 
 	sd	ra, 0(sp)
 
 	jal	siosh_init
 	nop
 
-	ld	ra, 0(sp)
+	ld	ra, 0(sp) 
 	addiu  sp, sp, 16
 	jr	ra
 	nop
